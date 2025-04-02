@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class SinusoidalPositionEmbeddings(nn.Module):
     """
@@ -63,6 +64,93 @@ class Block(nn.Module):
         
         # 上采样或下采样
         return self.transform(h)
+
+
+class PathUNet(nn.Module):
+    """
+    用于路径规划的条件UNet模型
+    """
+    def __init__(self, path_channels=2, time_dim=256, condition_channels=3, 
+                 path_length=64, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.time_dim = time_dim
+        self.path_length = path_length
+        
+        # 时间嵌入
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_dim),
+            nn.Linear(time_dim, time_dim),
+            nn.ReLU(),
+            nn.Linear(time_dim, time_dim)
+        )
+        
+        # 条件编码器
+        self.condition_encoder = nn.Sequential(
+            nn.Conv2d(condition_channels, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2, padding=1),  # 下采样
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 下采样
+            nn.ReLU(),
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),  # 下采样
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((8, 8)),  # 自适应池化到8x8
+        )
+        
+        # 路径嵌入
+        self.path_embedding = nn.Linear(path_channels * path_length, 512)
+        
+        # 融合路径和条件
+        self.fusion = nn.Sequential(
+            nn.Linear(512 + 256*8*8, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, path_channels * path_length)
+        )
+        
+        # 时间条件MLP
+        self.time_mlp_fusion = nn.Sequential(
+            nn.Linear(time_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512)
+        )
+        
+    def forward(self, x, t, condition):
+        """
+        Args:
+            x: 输入噪声路径 [B, L, 2]
+            t: 时间步 [B]
+            condition: 条件输入(地图+起点+终点) [B, 3, H, W]
+        Returns:
+            predicted_noise: 预测的噪声 [B, L, 2]
+        """
+        # 时间嵌入
+        t = t.to(self.device)
+        t_emb = self.time_mlp(t)
+        time_features = self.time_mlp_fusion(t_emb)
+        
+        # 扁平化路径
+        batch_size = x.shape[0]
+        x_flat = x.reshape(batch_size, -1)  # [B, L*2]
+        
+        # 路径特征
+        path_features = self.path_embedding(x_flat)  # [B, 512]
+        
+        # 条件特征
+        cond_features = self.condition_encoder(condition)  # [B, 256, 8, 8]
+        cond_flat = cond_features.reshape(batch_size, -1)  # [B, 256*8*8]
+        
+        # 融合特征
+        combined = torch.cat([path_features, cond_flat], dim=1)  # [B, 512+256*8*8]
+        combined = combined + time_features  # 添加时间特征
+        
+        # 预测输出
+        output = self.fusion(combined)  # [B, L*2]
+        output = output.reshape(batch_size, self.path_length, -1)  # [B, L, 2]
+        
+        return output
 
 
 class UNet(nn.Module):
